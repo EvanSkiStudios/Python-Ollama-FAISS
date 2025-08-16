@@ -21,7 +21,7 @@ def create_vector_db_from_json(json_file_name):
 
     # Role + content for embedding meaning
     embedding_texts = [
-        f"{msg['role'].upper()}: {msg['content']}"
+        f"{msg['role']}: {msg['content']}"
         for msg in messages
     ]
 
@@ -50,6 +50,7 @@ def create_vector_db_from_json(json_file_name):
 
     # apply embeddings to database
     index = faiss.IndexFlatL2(dim)
+    # noinspection PyArgumentList
     index.add(embeddings)
 
     # Save FAISS index
@@ -86,16 +87,18 @@ def search(query, index, metadata, k_results=3, max_distance=10.0):
 
     # Return metadata results
     results = []
+    # Loop through the retrieved indices and distances, keeping track of ranking order
     for rank, (idx, dist) in enumerate(zip(indices[0], distances[0])):
-        # Skip any crazy large distances
+        # Skip results that exceed the maximum allowed distance (i.e., too dissimilar)
         if dist > max_distance:
             continue
+        # Append a structured dictionary with the relevant metadata and ranking info
         results.append({
-            "rank": rank + 1,
-            "distance": float(dist),
-            "role": metadata[idx]["role"],
-            "name": metadata[idx]["name"],
-            "content": metadata[idx]["content"]
+            "rank": rank + 1,  # Rank starts at 1, not 0
+            "distance": float(dist),  # Convert distance to float for consistency
+            "role": metadata[idx]["role"],  # Role information from metadata
+            "name": metadata[idx]["name"],  # Name associated with the entry
+            "content": metadata[idx]["content"]  # The actual content or text
         })
 
     return results
@@ -106,11 +109,12 @@ def testing(index, metadata):
     matches = search(query_text, index, metadata, 20)
 
     for match in matches:
-        print(f"[{match['rank']}] ({match['role']}) {match['name'] or ''} -> {match['content']} [dist={match['distance']:.4f}]")
+        print(match)
+        #print(f"[{match['rank']}] ({match['role']}) {match['name'] or ''} -> {match['content']} [dist={match['distance']:.4f}]")
 
 
 def main():
-    args = create_vector_db_from_json('evanski_.json')
+    args = create_vector_db_from_json('testing.json')
     print(args[0])
 
     testing(args[0], args[1])
