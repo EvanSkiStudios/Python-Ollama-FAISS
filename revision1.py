@@ -92,7 +92,7 @@ def create_vector_db_from_json(json_file_name):
         embeddings = []
         for text in embedding_texts:
             resp = ollama.embed(
-                model="snowflake-arctic-embed2:latest",
+                model="snowflake-arctic-embed2",
                 input=text
             )
             embeddings.append(resp["embeddings"][0])
@@ -102,6 +102,7 @@ def create_vector_db_from_json(json_file_name):
 
         # Build FAISS index
         index = faiss.IndexFlatL2(dim)
+        # noinspection PyArgumentList
         index.add(embeddings)
 
         # Save files
@@ -122,10 +123,10 @@ def create_vector_db_from_json(json_file_name):
     return index, paired_metadata, embeddings
 
 
-def search(query, index, metadata, k_results=3, max_distance=2.0):
+def query_faiss_db(query, index, metadata, k_results=3, max_distance=2.0):
     # Embed the query
     resp = ollama.embed(
-        model="snowflake-arctic-embed2:latest",
+        model="snowflake-arctic-embed2",
         input=query
     )
 
@@ -158,26 +159,38 @@ def search(query, index, metadata, k_results=3, max_distance=2.0):
     return results
 
 
-def testing(query, index, metadata):
+def gather_relevant_memories_from_database(query, index, metadata):
     query_text = query
-    matches = search(query_text, index, metadata, 20)
+    matches = query_faiss_db(query_text, index, metadata, 20)
 
+    # print(f"[{match['rank']}] [dist={match['distance']:.4f}] {match['context']} ")
+
+    relevant_memories = []
     for match in matches:
-        print(f"[{match['rank']}] [dist={match['distance']:.4f}] {match['context']} ")
-
-        # Extract just the values and put them in a list
+        # Extract messages as a list of dicts
         messages = list(match["context"].values())
+        # Append the pair/group as-is to relevant_memories
+        relevant_memories.append(messages)
 
-        # Convert to JSON
-        json_str = json.dumps(messages, indent=2)
+        # Reverse the order of the message groups, not the dicts inside
+    relevant_memories.reverse()
+
+    # Flatten the list of lists into a single list of dicts
+    flattened_memories = [msg for group in relevant_memories for msg in group]
+
+    # Convert the whole flattened list to JSON once
+    json_str = json.dumps(flattened_memories, ensure_ascii=False, indent=2)
+    return json_str
 
 
 def main():
     args = create_vector_db_from_json('evanski_.json')
     print("Index built:", args[0].ntotal, "vectors")
 
-    query = "why is the sky blue?"
-    testing(query, args[0], args[1])
+    query = "what is 2+2?"
+    memories = gather_relevant_memories_from_database(query, args[0], args[1])
+
+    print(memories)
 
 
 if __name__ == "__main__":
