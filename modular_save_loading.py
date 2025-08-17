@@ -6,78 +6,59 @@ import ollama
 
 
 def build_or_load_faiss_index(json_file_name):
-    # Load JSON file
     running_dir = os.path.dirname(os.path.realpath(__file__))
     json_dir = os.path.join(running_dir, "dir")
     testing_json = os.path.join(json_dir, json_file_name)
 
-    # File paths (remove .json from base name)
     base_filename = json_file_name.replace('.json', '')
     index_path = os.path.join(json_dir, base_filename + "faiss_index.bin")
     metadata_path = os.path.join(json_dir, base_filename + "metadata.json")
     embeddings_path = os.path.join(json_dir, base_filename + "embeddings.npy")
 
-    # Load original messages from JSON
+    # Load latest JSON messages
     with open(testing_json, "r", encoding="utf-8") as f:
         raw_messages = json.load(f)
 
-    # ------------------------
-    # Pair user+assistant messages
-    # ------------------------
+    # Pair messages
     paired_messages = []
     i = 0
     while i < len(raw_messages):
         msg = raw_messages[i]
-
         if msg["role"] == "user" and i + 1 < len(raw_messages) and raw_messages[i + 1]["role"] == "assistant":
-            pair = {
-                "user": {
-                    "role": msg["role"],
-                    "name": msg.get("name"),
-                    "content": msg["content"]
-                },
-                "assistant": {
-                    "role": raw_messages[i + 1]["role"],
-                    "name": raw_messages[i + 1].get("name"),
-                    "content": raw_messages[i + 1]["content"]
-                }
-            }
-            paired_messages.append(pair)
+            paired_messages.append({
+                "user": {"role": msg["role"], "name": msg.get("name"), "content": msg["content"]},
+                "assistant": {"role": raw_messages[i+1]["role"], "name": raw_messages[i+1].get("name"), "content": raw_messages[i+1]["content"]}
+            })
             i += 2
         else:
-            pair = {
-                msg["role"]: {
-                    "role": msg["role"],
-                    "name": msg.get("name"),
-                    "content": msg["content"]
-                }
-            }
-            paired_messages.append(pair)
+            paired_messages.append({
+                msg["role"]: {"role": msg["role"], "name": msg.get("name"), "content": msg["content"]}
+            })
             i += 1
 
-    # ------------------------
-    # Decide whether to regenerate or load cache
-    # ------------------------
-    needs_regeneration = False
-
+    # If no cache, build from scratch
     if not (os.path.exists(metadata_path) and os.path.exists(embeddings_path) and os.path.exists(index_path)):
-        needs_regeneration = True
-    else:
-        # Check cached metadata length matches new one
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            cached_metadata = json.load(f)
+        print("No cache found, building from scratch...")
+        return _build_from_scratch(paired_messages, index_path, metadata_path, embeddings_path)
 
-        if len(cached_metadata) != len(paired_messages):
-            needs_regeneration = True
+    # Load existing cache
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        cached_metadata = json.load(f)
+    cached_embeddings = np.load(embeddings_path)
+    index = faiss.read_index(index_path)
 
-    if needs_regeneration:
-        print("Regenerating embeddings and FAISS index...")
+    # Compare cached vs fresh
+    if paired_messages == cached_metadata:
+        print("No changes detected, using cache.")
+        return {"index": index, "metadata": cached_metadata, "embeddings": cached_embeddings}
 
-        # ------------------------
-        # Build embedding texts with context
-        # ------------------------
+    # If the cached data is a *prefix* of the new data → append only
+    if len(paired_messages) > len(cached_metadata) and paired_messages[:len(cached_metadata)] == cached_metadata:
+        new_messages = paired_messages[len(cached_metadata):]
+        print(f"Detected {len(new_messages)} new messages, appending to index...")
+
         texts_for_embedding = []
-        for pair in paired_messages:
+        for pair in new_messages:
             if "user" in pair and "assistant" in pair:
                 text = f"USER: {pair['user']['content']} ASSISTANT: {pair['assistant']['content']}"
             elif "user" in pair:
@@ -86,45 +67,60 @@ def build_or_load_faiss_index(json_file_name):
                 text = f"ASSISTANT: {pair['assistant']['content']}"
             texts_for_embedding.append(text)
 
-        # ------------------------
-        # Generate embeddings
-        # ------------------------
-        embedding_vectors = []
+        # Embed only new messages
+        new_vectors = []
         for text in texts_for_embedding:
-            resp = ollama.embed(
-                model="snowflake-arctic-embed2",
-                input=text
-            )
-            embedding_vectors.append(resp["embeddings"][0])
+            resp = ollama.embed(model="snowflake-arctic-embed2", input=text)
+            new_vectors.append(resp["embeddings"][0])
 
-        embedding_vectors = np.array(embedding_vectors, dtype="float32")
-        dim = embedding_vectors.shape[1]
+        new_vectors = np.array(new_vectors, dtype="float32")
+        index.add(new_vectors)
 
-        # Build FAISS index
-        index = faiss.IndexFlatL2(dim)
-        # noinspection PyArgumentList
-        index.add(embedding_vectors)
+        # Update caches
+        cached_metadata.extend(new_messages)
+        updated_embeddings = np.vstack([cached_embeddings, new_vectors])
 
-        # Save files
-        faiss.write_index(index, index_path)
         with open(metadata_path, "w", encoding="utf-8") as f:
-            json.dump(paired_messages, f, ensure_ascii=False, indent=2)
-        np.save(embeddings_path, embedding_vectors)
+            json.dump(cached_metadata, f, ensure_ascii=False, indent=2)
+        np.save(embeddings_path, updated_embeddings)
+        faiss.write_index(index, index_path)
 
-    else:
-        print("Loading cached embeddings and FAISS index...")
+        return {"index": index, "metadata": cached_metadata, "embeddings": updated_embeddings}
 
-        # Load cache
-        with open(metadata_path, "r", encoding="utf-8") as f:
-            paired_messages = json.load(f)
-        embedding_vectors = np.load(embeddings_path)
-        index = faiss.read_index(index_path)
+    # Otherwise → changes/deletes detected, rebuild
+    print("Changes or deletions detected, rebuilding index from scratch...")
+    return _build_from_scratch(paired_messages, index_path, metadata_path, embeddings_path)
 
-    return {
-        "index": index,
-        "metadata": paired_messages,
-        "embeddings": embedding_vectors
-    }
+
+def _build_from_scratch(paired_messages, index_path, metadata_path, embeddings_path):
+    texts_for_embedding = []
+    for pair in paired_messages:
+        if "user" in pair and "assistant" in pair:
+            text = f"USER: {pair['user']['content']} ASSISTANT: {pair['assistant']['content']}"
+        elif "user" in pair:
+            text = f"USER: {pair['user']['content']}"
+        else:
+            text = f"ASSISTANT: {pair['assistant']['content']}"
+        texts_for_embedding.append(text)
+
+    embedding_vectors = []
+    for text in texts_for_embedding:
+        resp = ollama.embed(model="snowflake-arctic-embed2", input=text)
+        embedding_vectors.append(resp["embeddings"][0])
+
+    embedding_vectors = np.array(embedding_vectors, dtype="float32")
+    dim = embedding_vectors.shape[1]
+
+    index = faiss.IndexFlatL2(dim)
+    # noinspection PyArgumentList
+    index.add(embedding_vectors)
+
+    faiss.write_index(index, index_path)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(paired_messages, f, ensure_ascii=False, indent=2)
+    np.save(embeddings_path, embedding_vectors)
+
+    return {"index": index, "metadata": paired_messages, "embeddings": embedding_vectors}
 
 
 def search_faiss_index(query, index, metadata, top_k=3, max_distance=2.0):
@@ -188,7 +184,7 @@ def get_relevant_messages(query, index, metadata):
 
 
 def main():
-    faiss_data = build_or_load_faiss_index('evanski_.json')
+    faiss_data = build_or_load_faiss_index('testing.json')
     print("Index built:", faiss_data["index"].ntotal, "vectors")
 
     query = "what is 2+2?"
